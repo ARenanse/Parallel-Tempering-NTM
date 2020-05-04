@@ -1,8 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from abc import ABC, abstractmethod
-import multiprocessing
+import torch.multiprocessing as mp
 import torch
+from queue import Queue
 
 #Uses CamelCase all around.
 
@@ -13,34 +14,33 @@ import torch
 #     Therefore, if one wishes to pass a Regression or Classification Task, then the shape would be [BatchSize, 1, Features]
 #  4. Space in subsequent lines of Docstring is used to distinguish between the parameters which are still fuzzy (due to 1 or 2 or both) and which are not.
 #  5. !! ---> Projected to use in a feature in future updates.
+#  6. DEPREC ---> Deprecated feature.
 
-
-
-class PTReplicaMetaBase(ABC):
+class PTReplicaMetaBase(ABC, mp.Process):
     
-    def __init__(self, Model, NumSamples, GlobalFraction, Temperature, UseLG, LGProb, TrainData, TestData, lr, RWStepSize, Optimizer = torch.optim.SGD, LossFunc = torch.nn.MSELoss, ):
+    def __init__(self, Model, NumSamples, GlobalFraction, Temperature, UseLG, LGProb, TrainData, TestData, lr, RWStepSize, ChildConn, Optimizer = torch.optim.SGD, LossFunc = torch.nn.MSELoss,):
         
         """
-        Model : (?) Pytorch Model.
-        
+        Model : (PyTorch.nn Model) Pytorch Model.
+DEPREC  ListSamples : (mp.Queue) Queue in which samples for this replica will be put.
+DEPREC  ListMiscSamples : (mp.Queue) List in which samples for the Miscellaneous Parameters will be put.
         NumSamples : (int), No. of samples to find for this Replica.
         GlobalFraction : (float), Fraction of NumSamples in which Temperature will be assigned as per the Beta scheme.
         Temperature : (float), Temperature assignment for this Replica.
         UseLG : (bool), Whether to use Langevin Gradients or not.
         LGProb : (float), Probability by which to choose Langevin Dynamics for MH proposal distributions.
-        
-        TrainData : (NP Array?) [BatchSize, Timesteps, Features], Data to train the model on.
-        TestData : (NP Array?) [BatchSize, Timesteps, Features], Data to test the model on for validation error trace.
-
+        TrainData : (NP Array) [BatchSize, Timesteps, Features], Data to train the model on.
+        TestData : (NP Array) [BatchSize, Timesteps, Features], Data to test the model on for validation error trace.
         lr : (float), Learning Rate.
         RWStepSize : (float), Step Size for Random Walk.
+        ChildConn : (mp.connection) It's used to transfer the Likelihood and Prior prob back to main process.
 !! ---> Optimizer : torch.optim 's Method, the optimizer to use while evaluating Langevin Gradients, default as SGD.
         LossFunc : torch.nn 's Method, the Loss function to use while evaluating Langevin Gradients, used in self.GiveMeTheLoss
        
         
         """
         super().__init__()
-        
+        mp.Process.__init__(self)
         self.Model = Model
         
         self.NumSamples = NumSamples
@@ -59,14 +59,19 @@ class PTReplicaMetaBase(ABC):
         self.RWStepSize = RWStepSize
         
         #Other Class Related Variables
-        self.accepts = 0
         self.ReplicaBeta = None  #The inverse of Temperature for this Replica, used in Likelihod and prior calculation.
-    
-    
+        
+        #Queues to Hold Samples of Parameters and Misc Parameters
+        #self.QueueSamples = QueueSamples
+
+        self.ChildConn = ChildConn
+
+        self.Swaps = 0
+        
     @abstractmethod
     def PriorLikelihood(self):
         """
-        Calculates the Prior Log Likelihood of the Model parameters as per the Prior distribution.
+        Calculates the Prior Log Likelihood [torch.tensor] of the Model parameters as per the Prior distribution.
         Should Return the log probability summed over all Weight and Biases.
         
         Returns an info list too if there are measures that one might need to track.
@@ -81,7 +86,7 @@ class PTReplicaMetaBase(ABC):
     @abstractmethod
     def Likelihood(self):
         """
-        Calculates the Log Likelihood over all the instances in Data Train 
+        Calculates the Log Likelihood [torch.tensor] over all the instances in Data Train 
         according to the Likelihood Distribution you choose to decide/implement after inheriting this class.
         
         Returns an info list too if there are measures that one might need to track.
@@ -95,7 +100,7 @@ class PTReplicaMetaBase(ABC):
     @abstractmethod
     def GiveMeTheLoss(self):
         """
-        Returns the loss using the self.LossFunc AFTER computing y_pred from Model as desired.
+        Returns the loss [torch.tensor] using the self.LossFunc AFTER computing y_pred from Model as desired.
         
         Abstracting this because calculating y_pred becomes 'Model' and 'TrainData' specefic task.
         """
@@ -132,8 +137,10 @@ class PTReplicaMetaBase(ABC):
     
         ClonedParams = []
         
-        for param in self.Model.parameters():
-            ClonedParams.append(param.clone())
+        with torch.no_grad():
+
+            for param in self.Model.parameters():
+                ClonedParams.append(param.clone())
 
         return ClonedParams
     
@@ -193,27 +200,42 @@ class PTReplicaMetaBase(ABC):
                 result += torch.sum(param)
 
         return result
-            
-       
     
-    def Runner(self):
+    def __TensorList_NumpyList(self, TensorList):
+
+
+        """
+        Converts a list of Tensors to a list of Numpy arrays
+        """            
+        result = []
+        with torch.no_grad():
+            for tens in TensorList:
+                result.append(tens.numpy())
+
+        return result
+
+
+    
+    def run(self):
         
+        self.name = "Replica: {} Kelvin".format(self.Temperature)
         """
         Runs this Replica for NumSamples according to the LGPT Algorithm to achieve NumSamples from the Posterior Distribution.
+        
+        SamplesQueue: (Queue), The Queue placeholder for all samples.
+        
+        Note this function will be executed by mp.start(), as it's name is 'run'. See multiprocessing docs for more details.
         """
         
-        self.accepts = 0
-        
-        CurrentPrior = self.CurrentPriorProb
-        CurrentLikelihood = self.CurrentLikelihoodProb
-        
-        Samples = []
-        
+        self.AcceptsInThisRun = 0
+
+        samples = []
         
         ThetaDict = self._ParamClonetoDict()
         
         for i in range(self.NumSamples):
             
+            print("In Loop: ",i)
             
             if (i < self.GlobalSamples): #Use Global Exploration by Setting Temperature
                 
@@ -244,92 +266,99 @@ class PTReplicaMetaBase(ABC):
                 loss = self.GiveMeTheLoss()
                 self.Model.zero_grad()
                 loss.backward()
-                GradsList = []
-                for param in self.Model.parameters():
-                    GradsList.append(param.grad.data)
-                #Step 3: Calculate Theta_gd
-                lr = self.learning_rate
-                Theta_gd = self.__NonLinCombLists(1, ParamCopyList, 1, -lr, GradsList, 1)
                 
-            #Calculating Theta_proposal = Theta_gd + N(0, step*I)
-                RandList = []
-                for theta in Theta_gd:
-                    RandList.append(torch.tensor(np.random.normal(0, self.RWStepSize, theta.shape)))
-                
-                Theta_proposal = self.__NonLinCombLists(1, Theta_gd, 1, 1, RandList, 1)
-                
-            #Calculate Theta_proposal_gd = Theta_proposal + alpha*gradient_{theta_proposal} [ Loss(f_{theta_proposal}) ]
-                
-                #Step 1: Set Model Parameters as Theta_proposal
-                ProposalStateDict = dict(zip(list(self.Model.state_dict().keys()), Theta_proposal))
-                self.Model.load_state_dict(ProposalStateDict)
-                
+                with torch.no_grad():
+                    GradsList = []
+                    for param in self.Model.parameters():
+                        GradsList.append(param.grad.data)
+                    #Step 3: Calculate Theta_gd
+                    lr = self.learning_rate
+                    Theta_gd = self.__NonLinCombLists(1, ParamCopyList, 1, -lr, GradsList, 1)
+
+                #Calculating Theta_proposal = Theta_gd + N(0, step*I)
+                    RandList = []
+                    for theta in Theta_gd:
+                        temp_tensor = torch.tensor(np.random.normal(0, self.RWStepSize, theta.shape))
+                        RandList.append(temp_tensor)
+                    #print("I think error is here for LG")
+                    Theta_proposal = self.__NonLinCombLists(1, Theta_gd, 1, 1, RandList, 1)
+
+                #Calculate Theta_proposal_gd = Theta_proposal + alpha*gradient_{theta_proposal} [ Loss(f_{theta_proposal}) ]
+
+                    #Step 1: Set Model Parameters as Theta_proposal
+                    ProposalStateDict = dict(zip(list(self.Model.state_dict().keys()), Theta_proposal))
+                    self.Model.load_state_dict(ProposalStateDict)
+
                 #Step 2: Do a backward pass to obtain gradients of model parameters wrt to Theta_proposal
                 loss2 = self.GiveMeTheLoss()
                 self.Model.zero_grad()
                 loss2.backward()
-                GradsList2 = []
-                for param in self.Model.parameters():
-                    GradsList2.append(param.grad.data)
-                Theta_proposal_gd = self.__NonLinCombLists(1, Theta_proposal, 1, -lr, GradsList2, 1)
                 
-                #Step 3: Reset the weights of the model to the original for this iteration.
-                self.Model.load_state_dict(ParamCopyDict)
-                
-            #Calculate differences in Current and Proposed Parameters
-                
-                ThetaC_delta = self.__NonLinCombLists(1, ParamCopyList, 1, -1, Theta_proposal_gd, 1)
-                ThetaP_delta = self.__NonLinCombLists(1, Theta_proposal, 1, -1, Theta_gd, 1)
-                
-                
-                
-            #Calculate Delta Proposal which is used in MH Prob calculation, note it's delta(differnece) cause we are computing Log Probability for MH Prob
-            
-                coefficient = 1 / (self.Temperature * 2 * (self.RWStepSize))
-                DeltaProposal_List = self.__NonLinCombLists( coefficient, ThetaP_delta, 2, coefficient, ThetaC_delta, 2 )   #The objective output!
-                
-                DeltaProposal = self.__ReduceSumEachElement(DeltaProposal_List)
-                
+                with torch.no_grad():
+                    GradsList2 = []
+                    for param in self.Model.parameters():
+                        GradsList2.append(param.grad.data)
+                    Theta_proposal_gd = self.__NonLinCombLists(1, Theta_proposal, 1, -lr, GradsList2, 1)
+
+                    #Step 3: Reset the weights of the model to the original for this iteration.
+                    self.Model.load_state_dict(ParamCopyDict)
+
+                #Calculate differences in Current and Proposed Parameters
+
+                    ThetaC_delta = self.__NonLinCombLists(1, ParamCopyList, 1, -1, Theta_proposal_gd, 1)
+                    ThetaP_delta = self.__NonLinCombLists(1, Theta_proposal, 1, -1, Theta_gd, 1)
+
+
+
+                #Calculate Delta Proposal which is used in MH Prob calculation, note it's delta(differnece) cause we are computing Log Probability for MH Prob
+
+                    coefficient = self.ReplicaBeta / ( 2 * (self.RWStepSize))
+                    DeltaProposal_List = self.__NonLinCombLists( coefficient, ThetaP_delta, 2, coefficient, ThetaC_delta, 2 )   #The objective output!
+
+                    DeltaProposal = self.__ReduceSumEachElement(DeltaProposal_List)
+
             
             
             else: 
                 print("I'm in MH Random Walk!!")
             #PERFORMS RANDOM WALK UPDATES
+                with torch.no_grad():
+                    DeltaProposal = 0
+
+                    RandList = []
+                    for param in ParamCopyList:
+                        temp_tensor2 =  torch.tensor(np.random.normal(0, self.RWStepSize, param.shape))
+                        RandList.append(temp_tensor2)
+                    #print("I think error is here for MH")
+                    Theta_proposal = self.__NonLinCombLists(1, ParamCopyList, 1, 1, RandList, 1)
+
+            with torch.no_grad():
                 
-                DeltaProposal = 0
-                
-                RandList = []
-                for param in ParamCopyList:
-                    RandList.append(torch.tensor(np.random.normal(0, self.RWStepSize, param.shape)))
-                    
-                Theta_proposal = self.__NonLinCombLists(1, ParamCopyList, 1, 1, RandList, 1)
-                
-                
-            #Propose new values to Miscellaneous Parameters using ProposeMiscParameters
-            MiscProposalList = self.ProposeMiscParameters()
-            
-            
-            #Calculate Likelihood Probability with the Theta_proposal and New Proposals for Miscellaneous Parameters.(Note this is a log probability)
-            LHProposalProb, infoLH = self.Likelihood(MiscProposalList, Theta_proposal)
-            print("Likelihood Loss on the Proposed Parameters: ", infoLH)
-            #Calculate Prior Probability with the New Proposals for Misc Parameters and/or/maybe the Theta_Proposal too( and if that happens, it implies
-            # that calculation of the prior is also dependent on the model which is a highly unlikely case.). 
-            #  Note this is a log probability.
-            PriorProposalProb, infoPrior = self.PriorLikelihood(MiscProposalList, Theta_proposal)
-            
-            
-            #Calculate DeltaPrior and DeltaLikelihood for MH Probability calculation.
-            DeltaPrior = PriorProposalProb - self.CurrentPriorProb
-            DeltaLikelihood = LHProposalProb - self.CurrentLikelihoodProb 
-            
-            #Calculate Metropolis-Hastings Acceptance Probability.
-            print("DeltaPrior: ", DeltaPrior)
-            print("DeltaLikelihood: ", DeltaLikelihood)
-            print("DeltaProposal: ", DeltaProposal)
-            
-            
-            alpha = min(1, torch.exp(DeltaPrior + DeltaLikelihood + DeltaProposal)) 
-            print("Alpha: ", alpha)
+                #Propose new values to Miscellaneous Parameters using ProposeMiscParameters
+                MiscProposalList = self.ProposeMiscParameters()
+
+
+                #Calculate Likelihood Probability with the Theta_proposal and New Proposals for Miscellaneous Parameters.(Note this is a log probability)
+                LHProposalProb, infoLH = self.Likelihood(MiscProposalList, Theta_proposal)
+                print("Likelihood Loss on the Proposed Parameters: ", infoLH)
+                #Calculate Prior Probability with the New Proposals for Misc Parameters and/or/maybe the Theta_Proposal too( and if that happens, it implies
+                # that calculation of the prior is also dependent on the model which is a highly unlikely case.). 
+                #  Note this is a log probability.
+                PriorProposalProb, infoPrior = self.PriorLikelihood(MiscProposalList, Theta_proposal)
+
+
+                #Calculate DeltaPrior and DeltaLikelihood for MH Probability calculation.
+                DeltaPrior = PriorProposalProb - self.CurrentPriorProb
+                DeltaLikelihood = LHProposalProb - self.CurrentLikelihoodProb 
+
+                #Calculate Metropolis-Hastings Acceptance Probability.
+                print("DeltaPrior: ", DeltaPrior)
+                print("DeltaLikelihood: ", DeltaLikelihood)
+                print("DeltaProposal: ", DeltaProposal)
+
+
+                alpha = min(1, torch.exp(DeltaPrior + DeltaLikelihood + DeltaProposal)) 
+                print("Alpha: ", alpha)
             
             #EXECUTING METROPOLIS HASTINGS ACCEPTANCE CRITERION
             
@@ -340,38 +369,44 @@ class PTReplicaMetaBase(ABC):
                 print("Accepted!!")
                 print("\n\n")
 
-                
-                #Change current Likelihood and Prior Probability.
-                self.CurrentLikelihoodProb = LHProposalProb
-                self.CurrentPriorProb = PriorProposalProb
-                ThetaDict = dict(zip(list(self.Model.state_dict().keys()), Theta_proposal))
-                
-                #Load The accepted parameters to the model
-                self.Model.load_state_dict(ThetaDict)
-                
-                #Accept the Miscellaneous Parameters
-                self.MiscParamList = MiscProposalList
-                
-                self.accepts += 1
-                
-                Samples.append(ThetaDict)
-                
+                with torch.no_grad():
+                    #Change current Likelihood and Prior Probability.
+                    self.CurrentLikelihoodProb = LHProposalProb
+                    self.CurrentPriorProb = PriorProposalProb
+                    ThetaDict = dict(zip(list(self.Model.state_dict().keys()), Theta_proposal))
+
+                    #Load The accepted parameters to the model
+                    self.Model.load_state_dict(ThetaDict)
+
+                    #Accept the Miscellaneous Parameters
+                    self.MiscParamList = MiscProposalList
+
+                    npList = self.__TensorList_NumpyList(self.__ParamClonetoList())
+
+                    #self.QueueSamples.put(  (npList, self.MiscParamList)  )
+                    samples.append( (npList, self.MiscParamList) )
+
+                    self.AcceptsInThisRun += 1
+
+                    
+
             else :
-                print("Rejected!!")
-                print("\n\n")
-                
-                #Reject all proposals.
-                #i.e. Model Parameters remains the same.
-                
-                Samples.append(ParamCopyDict)
-                
-    
+                with torch.no_grad():
+                    print("Rejected!!")
+                    print("\n\n")
+
+                    #Reject all proposals.
+                    #i.e. Model Parameters remains the same.
+
+                    npList = self.__TensorList_NumpyList(ParamCopyList)
+
+                    #self.QueueSamples.put(  (npList, self.MiscParamList) )
+                    samples.append( (npList, self.MiscParamList) )
+
+
+        self.ChildConn.send([samples, np.array(self.CurrentLikelihoodProb), np.array(self.CurrentPriorProb)])  
+
+        print("Returning from the loop!! of {}".format(self.name))
+        print("No. of accepts for the {} are: {}".format(self.name, self.AcceptsInThisRun))
         
-        return Samples, self.accepts
-                
-                
-                
-                
-                
-            
-            
+        return
