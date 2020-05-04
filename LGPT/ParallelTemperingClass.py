@@ -13,9 +13,13 @@ import time
 #   3. 
 #
 
-#PROCEDURE TO START TRAINING:
+#PROCEDURE TO MANUALLY START TRAINING:
 #   1. Call InitReplicas
 #   2. Call Runner
+#   3. Call CopyandSetReplicas to generate copied Processes to run again.
+#   4. Call Runner again
+#   5. Repeat
+
 
 
 #Note that if the first replica seems to be stuck (i.e. noticing a lot of rejections), then keep in mind first replica has temperature = 1K, i.e. exact Posterior Distribution
