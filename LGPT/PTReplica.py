@@ -7,7 +7,7 @@ import torch
 
 class BasicModel(PTReplicaMetaBase):
     
-    def __init__(self, D_in, H, D_out,  NumSamples, GlobalFraction, Temperature, UseLG, LGProb, TrainData, TestData, lr, RWStepSize, Optimizer = torch.optim.SGD, LossFunc = torch.nn.MSELoss,):
+    def __init__(self, D_in, H, D_out, NumSamples, GlobalFraction, Temperature, UseLG, LGProb, TrainData, TestData, lr, RWStepSize, ChildConn, Optimizer = torch.optim.SGD, LossFunc = torch.nn.MSELoss,):
         
         
         self.D_in = D_in
@@ -19,13 +19,16 @@ class BasicModel(PTReplicaMetaBase):
         
         
         #Meta parameters
-        self.CurrentPriorProb = -57.3986 #np.log(0.9)
-        self.CurrentLikelihoodProb = -53.1974 #np.log(0.5)
+        self.CurrentPriorProb = -57.3986 
+        self.CurrentLikelihoodProb = -53.1974 
         self.MiscParamList = [1.1, 2.2, 25, 0, 0]
         
+        
+ 
+        #Defining the Model.
         self.Model = torch.nn.Sequential( torch.nn.Linear(D_in, H), torch.nn.Sigmoid(), torch.nn.Linear(H, D_out) )
         
-        super().__init__(self.Model, NumSamples, GlobalFraction, Temperature, UseLG, LGProb, TrainData, TestData, lr, RWStepSize, Optimizer = torch.optim.SGD, LossFunc = torch.nn.MSELoss)
+        super().__init__(self.Model, NumSamples, GlobalFraction, Temperature, UseLG, LGProb, TrainData, TestData, lr, RWStepSize, ChildConn, Optimizer = torch.optim.SGD, LossFunc = torch.nn.MSELoss)
         
         """
         Specifications:
@@ -42,7 +45,7 @@ class BasicModel(PTReplicaMetaBase):
         This function is supposed to do the following things:-
                 1. Calculate y_pred (shape = [BatchSize, D_out]) on the entire batch of data by calling Train Data on Model.
                 2. Calculate the loss using the self.LossFunc with y_true (shape = [BatchSize, D_out]) and y_pred.
-                3. Return the loss
+                3. Return the loss [torch.tensor]
         """
         
         y_pred = self.Model(self.TrainData[:,:self.D_in])
@@ -113,7 +116,7 @@ class BasicModel(PTReplicaMetaBase):
         logprob = logprob1 + logprob2
         
         #Since we assume that the each row in the TrainData is independent, we calculate the product of each probability, that is, sum all individual log prob.
-        return torch.sum(logprob) * self.ReplicaBeta, [rmseloss]
+        return torch.sum(logprob) / self.Temperature, [rmseloss]
     
     
     
@@ -131,7 +134,7 @@ class BasicModel(PTReplicaMetaBase):
 
                 result += torch.sum(torch.square(param))
 
-        print("Sum of squares of the weights: ", result)
+        #print("Sum of squares of the weights: ", result)
         return result
 
         
@@ -153,9 +156,6 @@ class BasicModel(PTReplicaMetaBase):
         with torch.no_grad():                                     #      ^ * ((self.D_in * self.H + self.H + 2)/2)
             logprob_part1 =  -1 * np.log(2 * np.pi * MiscProposalList[2]) * ((self.D_in * self.H + self.H + 2)/2)  - (1/(2*MiscProposalList[2])) * self.SumTheSquareWeights(Theta_proposal) 
             logprob_part2 = (1 + MiscProposalList[3]) * np.log(MiscProposalList[1]) - (MiscProposalList[4]/MiscProposalList[1])
-
-        print("logprob_part1: ",logprob_part1)
-        print("logprob_part2: ",logprob_part2)
         
         return logprob_part1 - logprob_part2, [None]
     
