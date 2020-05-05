@@ -10,17 +10,15 @@ import time
 #Some Notations and other Subtleties:-
 #   1. We assume that the name of the class that has inherited the PTReplicaMetaBase has the name 'MyReplica' in the docstrings.
 #   2. Please note the Dosctring of 'InitReplicas'!!
-#   3. 
 #
 
 #PROCEDURE TO MANUALLY START TRAINING:
 #   1. Call InitReplicas
 #   2. Call Runner
-#   3. Call CopyandSetReplicas to generate copied Processes to run again.
-#   4. Call Runner again
-#   5. Repeat
-
-
+#   3. Call SwapExecutor
+#   4. Call CopyandSetReplicas to generate copied Processes to run again on next iteration.
+#   5. Call Runner again
+#   6. Repeat from step 3.
 
 #Note that if the first replica seems to be stuck (i.e. noticing a lot of rejections), then keep in mind first replica has temperature = 1K, i.e. exact Posterior Distribution
 #(not the flattened one that will appear at high temperatures), thus, there will be a lot of rejections if the starting point is the low probability regions in the posterior.
@@ -31,13 +29,14 @@ import time
 
 class ParallelTempering():
     
-    def __init__(self, ReplicaClass, NumReplicas, MaxSamples, SwapIntervalFraction, MaxTemp, BetaLadderMethod = 'GEO'):
+    def __init__(self, ReplicaClass, NumReplicas, MaxSamples, SwapInterval, MaxTemp, BetaLadderMethod = 'GEO'):
         
         """
         ReplicaClass : (class) The Class which inherits PTReplicaBaseClass and implements all the needed Abstract Functions.
         NumReplicas : (int) The number of Replicas to have for the algortihm.
         Maxsamples : (int) Maximum no. of Samples from each Replica.
-        SwapIntervalFraction : (float) The fraction of MaxSamples after which Swap Condition will be checked.
+        SwapInterval : (float) If < 1, Then it is the fraction of MaxSamples after which Swap Condition will be checked
+                                        and if it's >= 1, then it is the SwapInterval (i.e. Number of Samples before checking for a swap)
         MaxTemp : Maximum Temperature for the Ladder.
         BetaLadderMethod : (str) The method by which the BetaLadder will be constructed. Currently supports 'GEO' for Geometric, 'LIN' for Linear, 'HAR' for Harmonic.
         """
@@ -48,21 +47,31 @@ class ParallelTempering():
         self.MaxTemp = MaxTemp
         self.BetaLadderMethod = BetaLadderMethod
 
-        assert ((SwapIntervalFraction <= 1) and (SwapIntervalFraction >0)), "Fraction should be between 0 and 1"
-        self.SwapIntervalFraction = SwapIntervalFraction
+        #assert ((SwapInterval <= 1) and (SwapInterval >0)), "SwapInterval should be between 0 and 1"
+        if ((SwapInterval < 1) and (SwapInterval > 0)):
 
-        self.NumReplicaSamples = int(SwapIntervalFraction * MaxSamples)   #No.of iterations to run each Replica for in each iteration.
+            self.NumReplicaSamples = int(SwapInterval * MaxSamples)   #No.of iterations to run each Replica for in each iteration.
+
+        else:
+
+            assert isinstance(SwapInterval, int) == True, "If SwapInterval >= 1, then it should be of type integer."
+            self.NumReplicaSamples = SwapInterval
+
+        self.SwapInterval = SwapInterval
+
+
         print("Swap Condition will be tested every {} samples.".format(self.NumReplicaSamples))
 
         self.Temperatures = torch.tensor([1 for _ in range(NumReplicas)], dtype = torch.float64) #Placeholder for Temperatures.
         self.ReplicaList = [None for _ in range(NumReplicas)]
 
+        ################################################################ [DEPRECATED, NOW USES PIPES TO COMMUNICATE BACK] #########################################################
         #SamplesQueueList is an Important Variable in this Implementation, it holds (in the following order) Model's Weights(and Biases), Miscellaneous Param List
-        #for all the samples for each replica.######################################## [DEPRECATED, NOW USES PIPES TO COMMUNICATE BACK] #########################################################
+        #for all the samples for each replica.
         #self.SamplesQueueList = [mp.Queue() for _ in range(NumReplicas)] 
 
-
-        self.SamplesListAllReplicas = [ [] for _ in range(NumReplicas) ]
+        #Stores the Samples collected from the Last iteration where each chain collected NumReplicaSamples amount of samples
+        self.LastRunSamplesAllReplicas = [ [] for _ in range(NumReplicas) ]
 
 
         self.SwapHistory = []
@@ -70,7 +79,14 @@ class ParallelTempering():
         #Pipes to transfer the Likelihood and Prior Probabilities back ######################### USE PIPES LATER ON TO TRANSFER EVERYTHING TO MAIN PROCESS
         self.PipeList = [mp.Pipe() for _ in range(NumReplicas)]
 
+        #Have Replicas been Initialized? 
+        self.isInitReplicaCalled = False
     
+
+        #Final Samples Placeholder, it stores ALL MaxSamples amount of samples collected. It's updated only when Run
+        self.AllSamples = [ [] for _ in range(NumReplicas) ]
+
+
     def TempLadderInitializer(self):
         
         """
@@ -129,6 +145,7 @@ class ParallelTempering():
         PTReplicaMetaBase, just in the case that you might have the thought of using the individual Replica for testing/other purposes.
         """
         
+        self.args = args #Just to store the args for Making more Replicas/Copying.
         
         #Step 1. Calculte and Set the Temperatures, will be needed to alter the Replicas Temperature.
         self.TempLadderInitializer()
@@ -139,7 +156,7 @@ class ParallelTempering():
 
             self.ReplicaList[i] = self.ReplicaClass(*args)
 
-            self.args = args #Just to store the args for Making more Replicas/Copying.
+            self.ReplicaList[i].name = "CHAIN - {}".format(i)
 
             self.ReplicaList[i].Temperature = self.Temperatures[i]
 
@@ -148,6 +165,11 @@ class ParallelTempering():
             self.ReplicaList[i].NumSamples = self.NumReplicaSamples
             self.ReplicaList[i].ChildConn = self.PipeList[i][1] #Sending in the child connection   
         
+
+
+        self.isInitReplicaCalled = True
+    
+
         return True
 
 
@@ -170,7 +192,7 @@ class ParallelTempering():
 
             NewReplicas[i] = self.ReplicaClass(*self.args)
 
-
+            NewReplicas[i].name = self.ReplicaList[i].name
             NewReplicas[i].Model = self.ReplicaList[i].Model
             NewReplicas[i].Temperature = self.ReplicaList[i].Temperature
             NewReplicas[i].NumSamples = self.NumReplicaSamples
@@ -207,7 +229,8 @@ class ParallelTempering():
 
         return result
 
-    def RunReplicas(self):
+
+    def Run(self):
 
         """
         Runs the Replicas PARALLELY and collects the samples in NumReplicas amount of Lists.
@@ -233,11 +256,11 @@ class ParallelTempering():
 
         for i,replica in enumerate(self.ReplicaList):
 
-            self.SamplesListAllReplicas[i], replica.CurrentLikelihoodProb, replica.CurrentPriorProb = self.PipeList[i][0].recv()
+            self.LastRunSamplesAllReplicas[i], replica.CurrentLikelihoodProb, replica.CurrentPriorProb = self.PipeList[i][0].recv()
             
                                 # for i in range(self.NumReplicaSamples):
                                 #     for j in range(self.NumReplicas):
-                                #         self.SamplesListAllReplicas[j].append(self.SamplesQueueList[j].get())
+                                #         self.LastRunSamplesAllReplicas[j].append(self.SamplesQueueList[j].get())
 
         # Closing All the child Pipes!
         for i in range(self.NumReplicas):
@@ -258,9 +281,9 @@ class ParallelTempering():
         #   5. Optimizer's State (for the time when we'll introduce the Optimizer training.)
 
         for i,replica in enumerate(self.ReplicaList):  
-                                                      #                                                                                                ^ Setting last sample from the previous run as the model weight
-            replica.Model.load_state_dict(dict(zip( list(replica.Model.state_dict().keys()), self.__NPList_TensorList( self.SamplesListAllReplicas[i][-1][0] ))))
-            replica.MiscParamList = self.SamplesListAllReplicas[i][-1][1]
+                                                      #                                                                                                   ^ Setting last sample from the previous run as the model weight
+            replica.Model.load_state_dict(dict(zip( list(replica.Model.state_dict().keys()), self.__NPList_TensorList( self.LastRunSamplesAllReplicas[i][-1][0] ))))
+            replica.MiscParamList = self.LastRunSamplesAllReplicas[i][-1][1]
             
             #replica.CurrentLikelihoodProb, replica.CurrentPriorProb =  ProbList[i]
 
@@ -272,7 +295,7 @@ class ParallelTempering():
     def SwapExecutor(self, ):
 
         """
-        Applies Replica Swap Mechanism after collecting SwapInteral (i.e. NumReplicaSamples) samples
+        Applies Replica Swap Mechanism after collecting SwapInterval (i.e. NumReplicaSamples) samples
 
         Things this function will sequentially do:
             1.Gather the state_dict of model and MiscParamList of each replica
@@ -328,14 +351,65 @@ class ParallelTempering():
 
 
 
+    def RunChains(self, *args):
 
-    
-    
-    
-    
-    
-    
-    
-    
-    
-        
+        """
+        Runs all the chains to collect MaxSamples samples from each replica.
+
+        Each Replica collects self.NumReplicaSamples (SwapInterval) amout of samples in each run, therefore the Swap checks will be done int(MaxSamples/NumReplicaSamples) times
+        """
+
+        t1 = time.time()
+
+        if self.isInitReplicaCalled == False:
+
+            if (len(args)==0):
+
+                raise ValueError("It seems you have not Initialized the Replicas by calling InitReplicas. You can call InitReplicas, OR, pass the arguments to this function itself to initialize it within this function.")
+
+            self.InitReplicas(*args)
+            print("Replicas ready to run...")
+
+
+
+        NumSwapChecks = int(self.MaxSamples / self.NumReplicaSamples) #Check for Swaps this many times.
+
+        for i in range(NumSwapChecks - 1): # -1 because you don't need to check for swaps when you have already sampled maximum amount of times.
+
+            t2 = time.time()
+            #Run the replicas to collect NumReplicaSamples amount of samples from each replica
+            self.Run()
+
+            #Collect those replicas into self.AllSamples
+            for j in range(self.NumReplicas):
+                self.AllSamples[j].extend(self.LastRunSamplesAllReplicas[j])
+
+            #Checking for Swap Conditions on all Replicas
+            self.SwapExecutor()
+
+            #Creating New Process while preserving the Replicas' Information to run again.
+            self.CopyandSetReplicas()
+
+            t3 = time.time()
+            print('\n')
+            print("------------------------------ Run Number {} took {} seconds to complete ------------------------------".format(i+1, t3-t2))
+            print('\n')
+        #Run the replicas to collect NumReplicaSamples amount of samples from each replica, for the last time.
+        t2 = time.time()
+        self.Run()
+
+        #Collect those replicas into self.AllSamples, for the last time.
+        for j in range(self.NumReplicas):
+            self.AllSamples[j].extend(self.LastRunSamplesAllReplicas[j])
+
+        t3 = time.time()
+        print("------------------------------ Run Number {} took {} seconds to complete ------------------------------".format(NumSwapChecks, t3-t2))
+
+        t4 = time.time()
+        print('\n\n')
+
+
+        print("######################  All Runs Completed in {} seconds, saving samples now as 'Samples.npy' ###################### ".format(t4-t1))
+        np.save('Samples.npy',np.array(self.AllSamples), allow_pickle = True)
+
+        print("ALL DONE!")
