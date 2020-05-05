@@ -18,7 +18,7 @@ from queue import Queue
 
 class PTReplicaMetaBase(ABC, mp.Process):
     
-    def __init__(self, Model, NumSamples, GlobalFraction, Temperature, UseLG, LGProb, TrainData, TestData, lr, RWStepSize, ChildConn, Optimizer = torch.optim.SGD, LossFunc = torch.nn.MSELoss,):
+    def __init__(self, Model, NumSamples, GlobalFraction, Temperature, UseLG, LGProb, TrainData, TestData, lr, RWStepSize, ChildConn, LossFunc = torch.nn.MSELoss,):
         
         """
         Model : (PyTorch.nn Model) Pytorch Model.
@@ -34,7 +34,6 @@ DEPREC  ListMiscSamples : (mp.Queue) List in which samples for the Miscellaneous
         lr : (float), Learning Rate.
         RWStepSize : (float), Step Size for Random Walk.
         ChildConn : (mp.connection) It's used to transfer the Likelihood and Prior prob back to main process.
-!! ---> Optimizer : torch.optim 's Method, the optimizer to use while evaluating Langevin Gradients, default as SGD.
         LossFunc : torch.nn 's Method, the Loss function to use while evaluating Langevin Gradients, used in self.GiveMeTheLoss
        
         
@@ -53,13 +52,13 @@ DEPREC  ListMiscSamples : (mp.Queue) List in which samples for the Miscellaneous
         
         self.GlobalSamples = NumSamples*GlobalFraction
         
-        self.Optimizer = Optimizer(self.Model.parameters(),lr = lr)
+        
         self.LossFunc = LossFunc(reduction = 'mean')
         self.learning_rate = lr
         self.RWStepSize = RWStepSize
         
         #Other Class Related Variables
-        self.ReplicaBeta = None  #The inverse of Temperature for this Replica, used in Likelihod and prior calculation.
+        self.ReplicaBeta = 1/Temperature  #The inverse of Temperature for this Replica, used in Likelihod and prior calculation.
         
         #Queues to Hold Samples of Parameters and Misc Parameters
         #self.QueueSamples = QueueSamples
@@ -89,7 +88,7 @@ DEPREC  ListMiscSamples : (mp.Queue) List in which samples for the Miscellaneous
         Calculates the Log Likelihood [torch.tensor] over all the instances in Data Train 
         according to the Likelihood Distribution you choose to decide/implement after inheriting this class.
         
-        Returns an info list too if there are measures that one might need to track.
+        Returns an info list too if there are measures that one might need to track. IF SO, THEN INCLUDE LIKELIHOOD LOSS AS FIRST ELEMENT.
         """
         print("Abstract Function without any implementation called!!!")
 
@@ -218,7 +217,6 @@ DEPREC  ListMiscSamples : (mp.Queue) List in which samples for the Miscellaneous
     
     def run(self):
         
-        self.name = "Replica: {} Kelvin".format(self.Temperature)
         """
         Runs this Replica for NumSamples according to the LGPT Algorithm to achieve NumSamples from the Posterior Distribution.
         
@@ -230,12 +228,14 @@ DEPREC  ListMiscSamples : (mp.Queue) List in which samples for the Miscellaneous
         self.AcceptsInThisRun = 0
 
         samples = []
+
+        maxLoss = -np.inf
         
         ThetaDict = self._ParamClonetoDict()
         
         for i in range(self.NumSamples):
             
-            print("In Loop: ",i)
+            #print("In Loop: ",i)
             
             if (i < self.GlobalSamples): #Use Global Exploration by Setting Temperature
                 
@@ -244,8 +244,7 @@ DEPREC  ListMiscSamples : (mp.Queue) List in which samples for the Miscellaneous
             else : #Use Local Exploration via Canonical MCMC
                 
                 self.ReplicaBeta = 1
-                
-            
+                        
             #Drawing a sample from U(0,1) to switch between LG Dynamics and Random Walk
             l = np.random.uniform(0,1)
             
@@ -254,7 +253,7 @@ DEPREC  ListMiscSamples : (mp.Queue) List in which samples for the Miscellaneous
             ParamCopyDict = self._ParamClonetoDict()
             
             if ((self.UseLG is True) and (l < self.LGProb)):
-                print("I'm in LG!!")
+                #print("I'm in LG!!")
             #PERFORMS LANGEVIN GRADIENT UPDATES for Prior (log)Likelihood and the (log)Likelihood
             
             #Calculating theta_gd = theta_init + alpha*gradient_{theta-init} [ Loss(f_{theta_init}) ]
@@ -320,7 +319,7 @@ DEPREC  ListMiscSamples : (mp.Queue) List in which samples for the Miscellaneous
             
             
             else: 
-                print("I'm in MH Random Walk!!")
+                #print("I'm in MH Random Walk!!")
             #PERFORMS RANDOM WALK UPDATES
                 with torch.no_grad():
                     DeltaProposal = 0
@@ -340,7 +339,10 @@ DEPREC  ListMiscSamples : (mp.Queue) List in which samples for the Miscellaneous
 
                 #Calculate Likelihood Probability with the Theta_proposal and New Proposals for Miscellaneous Parameters.(Note this is a log probability)
                 LHProposalProb, infoLH = self.Likelihood(MiscProposalList, Theta_proposal)
-                print("Likelihood Loss on the Proposed Parameters: ", infoLH)
+                #print("Likelihood Loss on the Proposed Parameters: ", infoLH[0])
+
+                if maxLoss < infoLH[0]:
+                    maxLoss = infoLH[0]
                 #Calculate Prior Probability with the New Proposals for Misc Parameters and/or/maybe the Theta_Proposal too( and if that happens, it implies
                 # that calculation of the prior is also dependent on the model which is a highly unlikely case.). 
                 #  Note this is a log probability.
@@ -352,13 +354,21 @@ DEPREC  ListMiscSamples : (mp.Queue) List in which samples for the Miscellaneous
                 DeltaLikelihood = LHProposalProb - self.CurrentLikelihoodProb 
 
                 #Calculate Metropolis-Hastings Acceptance Probability.
-                print("DeltaPrior: ", DeltaPrior)
-                print("DeltaLikelihood: ", DeltaLikelihood)
-                print("DeltaProposal: ", DeltaProposal)
+
+                # print("DeltaPrior: ", DeltaPrior)
+
+                # print("DeltaProposal: ", DeltaProposal)
 
 
                 alpha = min(1, torch.exp(DeltaPrior + DeltaLikelihood + DeltaProposal)) 
-                print("Alpha: ", alpha)
+
+                # if (i%int(self.NumSamples/5) == 0):
+                #     print("DeltaLikelihood at {} iteration for {}: {}".format(i, self.name ,DeltaLikelihood))
+                #     print("Alpha at {} for {}: {}".format(i, self.name ,alpha))
+
+
+
+                #print("Alpha: ", alpha)
             
             #EXECUTING METROPOLIS HASTINGS ACCEPTANCE CRITERION
             
@@ -366,8 +376,8 @@ DEPREC  ListMiscSamples : (mp.Queue) List in which samples for the Miscellaneous
             u = np.random.uniform(0,1)
             
             if u < alpha:
-                print("Accepted!!")
-                print("\n\n")
+                #print("Accepted!!")
+                #print("\n\n")
 
                 with torch.no_grad():
                     #Change current Likelihood and Prior Probability.
@@ -392,8 +402,8 @@ DEPREC  ListMiscSamples : (mp.Queue) List in which samples for the Miscellaneous
 
             else :
                 with torch.no_grad():
-                    print("Rejected!!")
-                    print("\n\n")
+                    #print("Rejected!!")
+                    #print("\n\n")
 
                     #Reject all proposals.
                     #i.e. Model Parameters remains the same.
@@ -406,7 +416,16 @@ DEPREC  ListMiscSamples : (mp.Queue) List in which samples for the Miscellaneous
 
         self.ChildConn.send([samples, np.array(self.CurrentLikelihoodProb), np.array(self.CurrentPriorProb)])  
 
+        print("-----> Statistics of {}".format(self.name))
+        print("{}-->> Temperature: ".format(self.name), self.Temperature)
+        print("{}-->> Number of Accepts In this Run / {}: {}".format(self.name, self.NumSamples , self.AcceptsInThisRun))
+        print("{}-->> Maximum Likelihood Loss on Proposed Parameters: ".format(self.name), maxLoss)
+        print("{}-->> Current Log Likelihood Prob after the run: ".format(self.name), self.CurrentLikelihoodProb)
+        print("{}-->> Current Likelihood Loss after the run: ".format(self.name), infoLH[0])
         print("Returning from the loop!! of {}".format(self.name))
-        print("No. of accepts for the {} are: {}".format(self.name, self.AcceptsInThisRun))
+        print("\n\n")
+
+        
+        #print("No. of accepts for the {} are: {}".format(self.name, self.AcceptsInThisRun))
         
         return
