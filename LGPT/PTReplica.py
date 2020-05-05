@@ -5,16 +5,17 @@ import torch
 # TESTING ABC PTReplicaMetaBase to Train a basic Model on a basic Regression task.
 
 
+
+#NOTE ONE CAN DEFINE TRAINING AND TESTING TENSOR SETS INSIDE THE CLASS ITSELF. 
 class BasicModel(PTReplicaMetaBase):
     
-    def __init__(self, D_in, H, D_out, NumSamples, GlobalFraction, Temperature, UseLG, LGProb, TrainData, TestData, lr, RWStepSize, ChildConn, Optimizer = torch.optim.SGD, LossFunc = torch.nn.MSELoss,):
+    def __init__(self, D_in, H, D_out, NumSamples, GlobalFraction, Temperature, UseLG, LGProb, TrainData, TestData, lr, RWStepSize, ChildConn, LossFunc = torch.nn.MSELoss,):
         
         
+        #Custom Parameters for the model
         self.D_in = D_in
         self.H = H
         self.D_out = D_out
-        
-        
         self.Step_eta = 0.2  #For proposing New Misc Parameters
         
         
@@ -23,12 +24,13 @@ class BasicModel(PTReplicaMetaBase):
         self.CurrentLikelihoodProb = -53.1974 
         self.MiscParamList = [1.1, 2.2, 25, 0, 0]
         
-        
- 
+
         #Defining the Model.
         self.Model = torch.nn.Sequential( torch.nn.Linear(D_in, H), torch.nn.Sigmoid(), torch.nn.Linear(H, D_out) )
         
-        super().__init__(self.Model, NumSamples, GlobalFraction, Temperature, UseLG, LGProb, TrainData, TestData, lr, RWStepSize, ChildConn, Optimizer = torch.optim.SGD, LossFunc = torch.nn.MSELoss)
+
+        #Initialize the Base Class.
+        super().__init__(self.Model, NumSamples, GlobalFraction, Temperature, UseLG, LGProb, TrainData, TestData, lr, RWStepSize, ChildConn, LossFunc = torch.nn.MSELoss)
         
         """
         Specifications:
@@ -116,7 +118,7 @@ class BasicModel(PTReplicaMetaBase):
         logprob = logprob1 + logprob2
         
         #Since we assume that the each row in the TrainData is independent, we calculate the product of each probability, that is, sum all individual log prob.
-        return torch.sum(logprob) / self.Temperature, [rmseloss]
+        return self.ReplicaBeta * torch.sum(logprob), [rmseloss]
     
     
     
