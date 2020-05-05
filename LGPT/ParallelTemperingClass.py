@@ -413,3 +413,5 @@ class ParallelTempering():
         np.save('Samples.npy',np.array(self.AllSamples), allow_pickle = True)
 
         print("ALL DONE!")
+        
+        return True
